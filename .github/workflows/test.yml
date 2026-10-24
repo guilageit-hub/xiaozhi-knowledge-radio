@@ -1,0 +1,23 @@
+name: Radio checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  host-and-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run host tests
+        run: |
+          g++ -std=c++20 -Wall -Wextra tests/radio/test_radio_stream.cc -o radio-tests
+          ./radio-tests
+      - name: Check integration against pinned upstream
+        run: |
+          git init xiaozhi-esp32
+          git -C xiaozhi-esp32 remote add origin https://github.com/78/xiaozhi-esp32.git
+          git -C xiaozhi-esp32 fetch --depth 1 origin 7e69845d818553ac045efbcde746b22bef6eecf6
+          git -C xiaozhi-esp32 checkout --detach FETCH_HEAD
+          git -C xiaozhi-esp32 apply --check ../integration/xiaozhi-radio.patch
+          git -C xiaozhi-esp32 apply ../integration/xiaozhi-radio.patch
+          cp -R main/radio xiaozhi-esp32/main/
+          git -C xiaozhi-esp32 diff --check

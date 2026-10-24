@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/78/xiaozhi-esp32",
+  "commit": "7e69845d818553ac045efbcde746b22bef6eecf6",
+  "board": "spotpear/sp-esp32-s3-1.28-box",
+  "variant": "sp-esp32-s3-1.28-box"
+}

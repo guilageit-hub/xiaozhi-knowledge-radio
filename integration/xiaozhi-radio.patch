@@ -1,0 +1,356 @@
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -44,6 +44,10 @@
+             )
+ 
+ set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols")
++
++if(CONFIG_ENABLE_RADIO_PLAYER)
++    list(APPEND SOURCES "radio/radio_player.cc" "radio/radio_tools.cc")
++endif()
+ 
+ # Add board common files
+ list(APPEND SOURCES
+@@ -1098,6 +1102,8 @@
+ endif()
+ 
+ set(MAIN_PRIV_REQUIRES_EXTRA "")
++# Dependency discovery runs before sdkconfig is available in IDF's early pass.
++list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_http_client)
+ if(CONFIG_XIAOZHI_NETWORK_ETHERNET AND CONFIG_XIAOZHI_ETH_PHY_IP101)
+     list(APPEND MAIN_PRIV_REQUIRES_EXTRA espressif__ip101)
+ endif()
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -1,4 +1,11 @@
+ menu "Xiaozhi Assistant"
++
++config ENABLE_RADIO_PLAYER
++    bool "HTTP(S) AAC/MP3 radio player"
++    depends on SPIRAM
++    default n
++    help
++        Enables device MCP radio playback. The cloud agent supplies station URLs.
+ 
+ config OTA_URL
+     string "Default OTA URL"
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -22,7 +22,7 @@
+ 
+ #define TAG "Application"
+ 
+-Application::Application() : notify_player_(audio_service_) {
++Application::Application() : notify_player_(audio_service_), radio_player_(audio_service_) {
+     event_group_ = xEventGroupCreate();
+ 
+ #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
+@@ -277,6 +277,7 @@
+         }
+ 
+         if (bits & MAIN_EVENT_CLOCK_TICK) {
++            ProcessPendingRadio();
+             clock_ticks_++;
+             auto display = Board::GetInstance().GetDisplay();
+             display->UpdateStatusBar();
+@@ -323,6 +324,7 @@
+ }
+ 
+ void Application::HandleNetworkDisconnectedEvent() {
++    CancelRadio();
+     // Close current conversation when network disconnected
+     auto state = GetDeviceState();
+     if (state == kDeviceStateNotifying) {
+@@ -581,8 +583,9 @@
+     });
+ 
+     protocol_->OnAudioChannelClosed([this, &board]() {
+-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+         Schedule([this]() {
++            Board::GetInstance().SetPowerSaveLevel(radio_player_.IsActive()
++                ? PowerSaveLevel::PERFORMANCE : PowerSaveLevel::LOW_POWER);
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
+             SetDeviceState(kDeviceStateIdle);
+@@ -636,6 +639,7 @@
+             }
+             if (strcmp(state->valuestring, "start") == 0) {
+                 Schedule([this]() {
++                    if (radio_player_.IsActive()) return;
+                     aborted_ = false;
+                     SetDeviceState(kDeviceStateSpeaking);
+                 });
+@@ -791,6 +795,7 @@
+ void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
+ 
+ void Application::HandleToggleChatEvent() {
++    CancelRadio();
+     auto state = GetDeviceState();
+ 
+     if (state == kDeviceStateNotifying) {
+@@ -855,6 +860,7 @@
+ }
+ 
+ void Application::HandleStartListeningEvent() {
++    CancelRadio();
+     auto state = GetDeviceState();
+ 
+     if (state == kDeviceStateNotifying) {
+@@ -908,6 +914,7 @@
+ }
+ 
+ void Application::HandleWakeWordDetectedEvent() {
++    CancelRadio();
+     if (!protocol_) {
+         return;
+     }
+@@ -1180,6 +1187,10 @@
+ }
+ 
+ void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
++    if (radio_pending_.load() || radio_player_.IsActive()) {
++        ESP_LOGW(TAG, "Ignoring notification during radio playback");
++        return;
++    }
+     if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
+         ESP_LOGW(TAG, "Ignoring notify message while device is busy");
+         return;
+@@ -1379,6 +1390,7 @@
+ }
+ 
+ bool Application::CanEnterSleepMode() {
++    if (radio_pending_.load() || radio_player_.IsActive()) return false;
+     if (GetDeviceState() != kDeviceStateIdle) {
+         return false;
+     }
+@@ -1393,6 +1405,74 @@
+ 
+     // Now it is safe to enter sleep mode
+     return true;
++}
++
++bool Application::QueueRadio(const std::string& name, const std::string& url) {
++#if CONFIG_ENABLE_RADIO_PLAYER
++    if (name.empty() || name.size() > 160 || url.empty() || url.size() > 2048) return false;
++    const auto ticket = radio_requests_.Advance();
++    Schedule([this, name, url, ticket]() {
++        if (!radio_requests_.IsCurrent(ticket)) return;
++        ClearRadio();
++        pending_radio_name_ = name;
++        pending_radio_url_ = url;
++        pending_radio_time_ = esp_timer_get_time();
++        pending_radio_ticket_ = ticket;
++        radio_pending_.store(true);
++    });
++    return true;
++#else
++    return false;
++#endif
++}
++
++void Application::StopRadio() {
++    const auto ticket = radio_requests_.Advance();
++    Schedule([this, ticket]() { if (radio_requests_.IsCurrent(ticket)) ClearRadio(); });
++}
++
++void Application::CancelRadio() {
++    radio_requests_.Advance();
++    ClearRadio();
++}
++
++void Application::ClearRadio() {
++    radio_pending_.store(false);
++    radio_player_.Stop();
++}
++
++std::string Application::RadioStatus() const {
++    return radio_pending_.load() ? "{\"state\":\"queued\"}" : radio_player_.Status();
++}
++
++void Application::ProcessPendingRadio() {
++    const bool active = radio_player_.IsActive();
++    if (radio_power_owned_ && !active && !radio_pending_.load()) {
++        const bool idle = GetDeviceState() == kDeviceStateIdle &&
++                          (!protocol_ || !protocol_->IsAudioChannelOpened());
++        if (radio::ReleasePower(radio_power_owned_, active, radio_pending_.load(), idle)) {
++            Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
++        }
++        radio_power_owned_ = false;
++    }
++    if (!radio_pending_.load() || esp_timer_get_time() - pending_radio_time_ < 1000000) return;
++    if (!radio_requests_.IsCurrent(pending_radio_ticket_)) {
++        ClearRadio();
++        return;
++    }
++    // Let the MCP reply leave the device and any spoken confirmation finish first.
++    if (GetDeviceState() == kDeviceStateSpeaking || !audio_service_.IsPlaybackIdle()) {
++        if (esp_timer_get_time() - pending_radio_time_ > 30000000) CancelRadio();
++        return;
++    }
++    radio_pending_.store(false);
++    if (GetDeviceState() != kDeviceStateIdle && GetDeviceState() != kDeviceStateListening) return;
++    audio_service_.EnableVoiceProcessing(false);
++    if (protocol_ && protocol_->IsAudioChannelOpened()) protocol_->CloseAudioChannel();
++    SetDeviceState(kDeviceStateIdle);
++    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
++    radio_power_owned_ = true;
++    radio_player_.Play(pending_radio_name_, pending_radio_url_);
+ }
+ 
+ void Application::RegisterMcpBroadcastCallback(std::function<void(const std::string&)> callback) {
+--- a/main/application.h
++++ b/main/application.h
+@@ -20,6 +20,8 @@
+ #include "device_state.h"
+ #include "device_state_machine.h"
+ #include "notify/notify_player.h"
++#include "radio/radio_player.h"
++#include "radio/radio_stream.h"
+ 
+ // Main event bits
+ #define MAIN_EVENT_SCHEDULE             (1 << 0)
+@@ -118,6 +120,9 @@
+     AecMode GetAecMode() const { return aec_mode_; }
+     void PlaySound(const std::string_view& sound);
+     AudioService& GetAudioService() { return audio_service_; }
++    bool QueueRadio(const std::string& name, const std::string& url);
++    void StopRadio();
++    std::string RadioStatus() const;
+     
+     /**
+      * Reset protocol resources (thread-safe)
+@@ -143,6 +148,16 @@
+     std::string startup_wake_word_hint_message_;
+     AudioService audio_service_;
+     NotifyPlayer notify_player_;
++    RadioPlayer radio_player_;
++    std::atomic<bool> radio_pending_{false};
++    std::string pending_radio_name_, pending_radio_url_;
++    int64_t pending_radio_time_ = 0;
++    radio::RequestEpoch radio_requests_;
++    uint64_t pending_radio_ticket_ = 0;
++    bool radio_power_owned_ = false;
++    void ClearRadio();
++    void CancelRadio();
++    void ProcessPendingRadio();
+     uint32_t notification_playback_id_ = 0;
+     std::unique_ptr<Ota> ota_;
+ 
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -608,6 +608,7 @@
+ 
+ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
+     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
++    if (external_playback_token_) return false;
+     const uint32_t generation = playback_generation_;
+     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
+         if (wait) {
+@@ -804,6 +805,7 @@
+     {
+         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+         ++playback_generation_;
++        external_playback_token_ = 0;
+         std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
+         if (opus_decoder_ != nullptr) {
+             esp_opus_dec_reset(opus_decoder_);
+@@ -819,6 +821,47 @@
+     if (notify_drained && callbacks_.on_playback_drained) {
+         callbacks_.on_playback_drained();
+     }
++}
++
++uint32_t AudioService::BeginExternalPlayback() {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    if (++playback_generation_ == 0) ++playback_generation_;
++    external_playback_token_ = playback_generation_;
++    audio_decode_queue_.clear();
++    audio_playback_queue_.clear();
++    timestamp_queue_.clear();
++    audio_queue_cv_.notify_all();
++    return external_playback_token_;
++}
++
++bool AudioService::PushExternalPcm(uint32_t token, const int16_t* samples, size_t count) {
++    if (!token || !samples || !count || count > 960) return false;
++    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
++    if (!audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(250), [this, token]() {
++            return service_stopped_.load() || token != external_playback_token_ ||
++                   !audio_playback_queue_.full();
++        }) || service_stopped_.load() || token != external_playback_token_) return false;
++    AudioTask task;
++    task.type = kAudioTaskTypeDecodeToPlaybackQueue;
++    task.pcm.assign(samples, samples + count);
++    playback_drained_notified_ = false;
++    audio_playback_queue_.push_back(std::move(task));
++    audio_queue_cv_.notify_all();
++    return true;
++}
++
++void AudioService::EndExternalPlayback(uint32_t token) {
++    bool notify = false;
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        if (!token || token != external_playback_token_) return;
++        external_playback_token_ = 0;
++        ++playback_generation_;
++        audio_playback_queue_.clear();
++        notify = MarkPlaybackDrainedLocked();
++        audio_queue_cv_.notify_all();
++    }
++    if (notify && callbacks_.on_playback_drained) callbacks_.on_playback_drained();
+ }
+ 
+ bool AudioService::IsPlaybackDrainedLocked() const {
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -147,6 +147,10 @@
+     void PlaySound(const std::string_view& sound);
+     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
+     void ResetDecoder();
++    // Exclusive PCM producer; all queue operations remain owned by AudioService.
++    uint32_t BeginExternalPlayback();
++    bool PushExternalPcm(uint32_t token, const int16_t* samples, size_t count);
++    void EndExternalPlayback(uint32_t token);
+     void SetModelsList(srmodel_list_t* models_list);
+ 
+ private:
+@@ -195,6 +199,7 @@
+     bool output_in_flight_ = false;
+     bool playback_drained_notified_ = true;
+     uint32_t playback_generation_ = 0;
++    uint32_t external_playback_token_ = 0;
+     // For server AEC
+     FixedQueue<uint32_t, MAX_TIMESTAMPS_IN_QUEUE> timestamp_queue_;
+ 
+--- a/main/boards/spotpear/sp-esp32-s3-1.28-box/sp-esp32-s3-1.28-box.cc
++++ b/main/boards/spotpear/sp-esp32-s3-1.28-box/sp-esp32-s3-1.28-box.cc
+@@ -26,6 +26,7 @@
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/task.h"
+ #include "power_manager.h"
++#include "radio/radio_tools.h"
+ 
+ #define TAG "Spotpear_ESP32_S3_1_28_BOX"
+ 
+@@ -401,6 +402,9 @@
+         // 显示和背光可用后再初始化省电逻辑，避免空指针
+         InitializePowerSaveTimer();
+         InitializePowerManager();
++#if CONFIG_ENABLE_RADIO_PLAYER
++        RegisterRadioTools();
++#endif
+     }
+ 
+     ~Spotpear_ESP32_S3_1_28_BOX() {
+--- a/main/boards/spotpear/sp-esp32-s3-1.28-box/config.json
++++ b/main/boards/spotpear/sp-esp32-s3-1.28-box/config.json
+@@ -5,7 +5,7 @@
+     "builds": [
+         {
+             "name": "sp-esp32-s3-1.28-box",
+-            "sdkconfig_append": []
++            "sdkconfig_append": ["CONFIG_ENABLE_RADIO_PLAYER=y"]
+         }
+     ]
+ }

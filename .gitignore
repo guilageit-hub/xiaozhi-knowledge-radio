@@ -1,0 +1,11 @@
+xiaozhi-esp32/
+build/
+__pycache__/
+*.pyc
+*.bin
+*.elf
+*.map
+*.exe
+radio-tests
+.env
+.env.*
